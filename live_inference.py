@@ -140,7 +140,7 @@ def main():
         frame_count = 0
         while True:
             frame     = rotate_frame(stream.next_frame(), ROTATE_DEG)
-            results   = model(frame, imgsz=480, device="mps", verbose=False)
+            results   = model(frame, imgsz=480, device="mps", conf=0.75, verbose=False)
             annotated = results[0].plot()
             del results  # release MPS tensors immediately
 
