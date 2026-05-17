@@ -349,7 +349,7 @@ class GridScrollEstimator:
         return self.cum_scroll_y
 
 
-EMULATOR   = "/Users/agent/Library/Android/sdk/emulator/emulator"
+EMULATOR   = "/Users/talia/Library/Android/sdk/emulator/emulator"
 AVD_NAME   = "Small_Phone"
 MODEL_PATH = "model_weight/model.pt"
 W, H       = 240, 480
