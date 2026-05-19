@@ -144,8 +144,9 @@ class _OneEuro1D:
         return x_hat
 
 
-GRID_PERIOD     = 21       # px per lane (one hop = one period)
+GRID_PERIOD     = 22       # px per lane (one hop = one period)
 _GRID_LANE_MARGIN = 1      # px gap rendered between adjacent lanes
+_GRID_START_OFFSET = 9
 _GRID_X_RANGE   = (20, 180)
 _GRID_Y_RANGE   = (30, 420)
 _GRID_JUMP_CLAMP = 15      # px; |delta| above this is treated as a scene cut
@@ -273,6 +274,7 @@ class GridScrollEstimator:
     def __init__(self, lane_h: int = GRID_PERIOD, sobel_thresh: int = 21):
         self.lane_h:        int               = max(2, int(lane_h))
         self.sobel_thresh:  int               = max(1, int(sobel_thresh))
+        self.start_offset:  int               = _GRID_START_OFFSET % self.lane_h
         self.prev_offset:   Optional[float]   = None
         self.cum_scroll_y:  float             = 0.0
         self.last_score:    Optional[np.ndarray] = None
@@ -284,7 +286,15 @@ class GridScrollEstimator:
         if h == self.lane_h:
             return
         self.lane_h = h
+        self.start_offset %= self.lane_h
         self.prev_offset = None      # previous phase reference is in old units
+
+    def set_start_offset(self, offset: int) -> None:
+        offset = int(offset) % self.lane_h
+        if offset == self.start_offset:
+            return
+        self.start_offset = offset
+        self.prev_offset = None      # avoid an unwrap jump when tuning manually
 
     def set_sobel_thresh(self, t: int) -> None:
         self.sobel_thresh = max(1, int(t))
@@ -335,6 +345,7 @@ class GridScrollEstimator:
         else:
             sub = 0.0
         o_star_f = float((o_star + sub) % P)
+        o_star_f = float((o_star_f + self.start_offset) % P)
 
         # Phase-unwrap into cumulative scroll.
         if self.prev_offset is None:
@@ -955,10 +966,14 @@ def main():
         gridscroll.set_sobel_thresh(v)
         hxscroll.set_sobel_thresh(v)
 
+    def _on_grid_start(v):
+        gridscroll.set_start_offset(v)
+
     cv2.createTrackbar("lane_h",   "Detections", gridscroll.lane_h, 40, _on_lane_h)
     cv2.setTrackbarMin("lane_h",   "Detections", 5)
     cv2.createTrackbar("sobel_th", "Detections", gridscroll.sobel_thresh, 100, _on_sobel_th)
     cv2.setTrackbarMin("sobel_th", "Detections", 1)
+    cv2.createTrackbar("grid_start", "Detections", gridscroll.start_offset, 40, _on_grid_start)
     cv2.createTrackbar("grid_shift", "Detections", 0, 20, lambda v: None)
     cv2.createTrackbar("shift_x",    "Detections", 91, 200, lambda v: None)
     input("Press Enter to start detection… ")
@@ -993,6 +1008,7 @@ def main():
             hxscroll.flush()
             gridscroll.cum_scroll_y = 0.0
             gridscroll.prev_offset = None
+            gridscroll.set_start_offset(cv2.getTrackbarPos("grid_start", "Detections"))
             prev_cum_y = 0.0
             char_fx.reset()
             char_fy.reset()
@@ -1214,7 +1230,7 @@ def main():
                     if yb < H and yb != y:
                         cv2.line(annotated, (0, yb), (W, yb), (0, 200, 0), 1)
                 cv2.putText(annotated,
-                            f"scroll={gridscroll.cum_scroll_y:+.2f} o={gridscroll.prev_offset:.2f} h={lh} s={shift}",
+                            f"scroll={gridscroll.cum_scroll_y:+.2f} o={gridscroll.prev_offset:.2f} h={lh} start={gridscroll.start_offset} s={shift}",
                             (5, 15), 0, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
 
             if not minimal_mode and show_hx:
@@ -1263,6 +1279,8 @@ def main():
                 break
             elif key == ord("g"):
                 show_grid = not show_grid
+                if show_grid:
+                    minimal_mode = False
             elif key == ord("s"):
                 show_sobel = not show_sobel
                 if not show_sobel:
