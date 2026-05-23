@@ -1,11 +1,12 @@
-import heapq
 import json
 import os
 import subprocess
 import threading
 import time
+from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 import math
@@ -610,9 +611,14 @@ class GameOverDetector:
 
 
 _KEYCODES     = {"up": 19, "down": 20, "left": 21, "right": 22}  # Android KEYCODE_DPAD_*
+SEND_VM_KEYSTROKES = False
 ANIM_DURATION = 0.3   # seconds per button-press animation
 ANIM_DIST     = 22    # px of character displacement per press (= one lane)
 _ANIM_K       = 10.0  # decay rate; 1/k ≈ 0.10 s = time of peak velocity
+_LANE_COLOR_MIN_PIXELS = 1
+_LANE_ASSIGNMENT_MODE_FRAMES = 7
+LOG_CLASS_ID = 2
+LOG_LANE_Y_OFFSET_DEFAULT = 33
 
 # D-pad button regions (x1, y1, x2, y2) in frame coordinates.
 # Placed in the bottom-right corner of the 240×480 frame.
@@ -692,6 +698,8 @@ _run_logger: Optional[RunLogger] = None
 
 
 def send_direction(direction: str):
+    if not SEND_VM_KEYSTROKES:
+        return
     if _run_logger is not None:
         _run_logger.log_key(direction)
     cmd = ["adb", "shell", "input", "keyevent", str(_KEYCODES[direction])]
@@ -705,6 +713,8 @@ def send_direction(direction: str):
 def send_game_over_recovery():
     """Game-over recovery: press DPAD_DOWN 4× then ENTER. Sent as a
     single adb invocation so the keys arrive in order."""
+    if not SEND_VM_KEYSTROKES:
+        return
     cmd = ["adb", "shell", "input", "keyevent",
            "20", "20", "20", "20", "66"]
     threading.Thread(target=lambda: subprocess.run(cmd, capture_output=True),
@@ -731,211 +741,206 @@ def _draw_buttons(frame: np.ndarray) -> np.ndarray:
     return frame
 
 
-class Planner:
-    """A* search over (n_x, n_y, depth) states with moves up / wait /
-    left / right. Cost structure encodes the user's priority:
-        up   = 1   (always tried when safe)
-        wait = 2   (tried only when current position is *not* in danger)
-        side = 3   (tried only when staying put would get us hit)
-    Heuristic: lanes-still-needed-to-reach-goal — admissible because
-    the cheapest move advances one lane at unit cost.
-    Returns the first move of the chosen path; "wait" is mapped to None."""
-
-    _DELTAS = {
-        "up":    (0,           -ANIM_DIST),
-        "left":  (-ANIM_DIST,  0),
-        "right": (ANIM_DIST,   0),
-    }
-
-    def __init__(self,
-                 char_size: int          = 22,
-                 t_horizon: float        = ANIM_DURATION,
-                 obstacle_classes: tuple = (0, 1),  # cars, trains
-                 log_class: int          = 2,
-                 goal_lanes_ahead: int   = 2,
-                 max_depth: int          = 5,
-                 max_lateral: int        = 3,
-                 n_time_samples: int     = 5):
-        self.char_size        = char_size
-        self.t_horizon        = t_horizon
-        self.obstacle_classes = set(obstacle_classes)
-        self.log_class        = log_class
-        self.goal_lanes_ahead = goal_lanes_ahead
-        self.max_depth        = max_depth
-        self.max_lateral      = max_lateral
-        self.n_time_samples   = max(2, int(n_time_samples))
-
-    def plan(self, char_xy: tuple[float, float],
-             objects: list) -> Optional[str]:
-        cx0, cy0 = char_xy
-        half = self.char_size / 2.0
-        ad   = ANIM_DIST
-
-        # Search-trace state for visualisation.
-        self.last_origin: tuple        = (cx0, cy0)
-        self.last_explored: list       = []   # [(nx, ny, depth), ...]
-        self.last_path: list           = []   # [(nx, ny), ...]
-        self.last_first_move: Optional[str] = None
-        self.last_goal_reached: bool   = False
-
-        def box_at(nx: int, ny: int) -> tuple:
-            cx = cx0 + nx * ad
-            cy = cy0 + ny * ad
-            return (cx - half, cy - half, cx + half, cy + half)
-
-        def heur(ny: int) -> int:
-            return max(0, self.goal_lanes_ahead + ny)
-
-        counter = 0
-        init_state = (0, 0, 0)
-        init_path  = ((0, 0),)
-        heap: list = [(heur(0), counter, 0, init_state, None, init_path)]
-        counter += 1
-        visited: set = set()
-
-        best_first = None
-        best_ny    = 1
-        best_g     = 0
-        best_path  = init_path
-
-        while heap:
-            f, _, g, state, first_move, path = heapq.heappop(heap)
-            if state in visited:
-                continue
-            visited.add(state)
-            nx, ny, depth = state
-            self.last_explored.append((nx, ny, depth))
-
-            if ny <= -self.goal_lanes_ahead:
-                self.last_path = list(path)
-                self.last_first_move = first_move
-                self.last_goal_reached = True
-                return None if first_move == "wait" else first_move
-
-            if ny < best_ny or (ny == best_ny and g < best_g):
-                best_ny    = ny
-                best_g     = g
-                best_first = first_move
-                best_path  = path
-
-            if depth >= self.max_depth:
-                continue
-
-            t_offset    = depth * self.t_horizon
-            wait_box    = box_at(nx, ny)
-            wait_unsafe = self._is_unsafe(wait_box, objects, t_offset)
-
-            candidates = []
-            up_box = box_at(nx, ny - 1)
-            if not self._is_unsafe(up_box, objects, t_offset, prev_box=wait_box):
-                candidates.append(("up", (nx, ny - 1, depth + 1), 1, (nx, ny - 1)))
-            if not wait_unsafe:
-                candidates.append(("wait", (nx, ny, depth + 1), 2, (nx, ny)))
-            if wait_unsafe:
-                for name, dx in (("left", -1), ("right", 1)):
-                    new_nx = nx + dx
-                    if abs(new_nx) > self.max_lateral:
-                        continue
-                    side_box = box_at(new_nx, ny)
-                    if not self._is_unsafe(side_box, objects, t_offset,
-                                           prev_box=wait_box):
-                        candidates.append((name, (new_nx, ny, depth + 1), 3, (new_nx, ny)))
-
-            for move_name, new_state, step_cost, new_pos in candidates:
-                new_g = g + step_cost
-                new_f = new_g + heur(new_state[1])
-                new_first = move_name if first_move is None else first_move
-                new_path  = path + (new_pos,)
-                heapq.heappush(heap,
-                               (new_f, counter, new_g, new_state, new_first, new_path))
-                counter += 1
-
-        self.last_path = list(best_path)
-        self.last_first_move = best_first
-        self.last_goal_reached = False
-        if best_first is None or best_first == "wait":
-            return None
-        return best_first
-
-    def _is_unsafe(self, char_box, objects, t_offset: float = 0.0,
-                   prev_box: Optional[tuple] = None) -> bool:
-        """`char_box` is unsafe over [t_offset, t_offset+t_horizon] if (a)
-        any car/train overlaps the chicken at any of N sampled time
-        points along the window, or (b) the row is a water row at arrival
-        but no log overlaps the destination at arrival.
-
-        If `prev_box` is given, the chicken's box at sample dt is
-        interpolated between `prev_box` and `char_box` using the same
-        burst-decay curve `_anim_progress` that drives the on-screen
-        animation. With `prev_box=None` (or `prev_box==char_box`), the
-        chicken stays at `char_box` for the whole window — used for
-        the in-danger / wait-safety check."""
-        n     = self.n_time_samples
-        t0    = t_offset
-        t_end = t_offset + self.t_horizon
-        sample_dt = [self.t_horizon * i / (n - 1) for i in range(n)]
-
-        if prev_box is None or prev_box == char_box:
-            char_at = lambda _dt: char_box
-        else:
-            px1, py1, px2, py2 = prev_box
-            cx1, cy1, cx2, cy2 = char_box
-            def char_at(dt: float) -> tuple:
-                a = _anim_progress(dt)
-                return (px1 + a * (cx1 - px1), py1 + a * (cy1 - py1),
-                        px2 + a * (cx2 - px2), py2 + a * (cy2 - py2))
-
-        cy_lo, cy_hi = char_box[1], char_box[3]
-        log_in_row = False
-        on_log     = False
-        for obj in objects:
-            x1, y1, x2, y2 = obj["bbox"]
-            vx = obj.get("vx", 0.0)
-            vy = obj.get("vy", 0.0)
-            cls = obj.get("cls")
-            if cls in self.obstacle_classes:
-                for dt in sample_dt:
-                    t = t0 + dt
-                    cb = char_at(dt)
-                    ob = (x1 + vx * t, y1 + vy * t,
-                          x2 + vx * t, y2 + vy * t)
-                    if self._intersects(cb, ob):
-                        return True
-            elif cls == self.log_class:
-                # Log riding is decided at arrival time only.
-                box = (x1 + vx * t_end, y1 + vy * t_end,
-                       x2 + vx * t_end, y2 + vy * t_end)
-                if box[1] < cy_hi and box[3] > cy_lo:
-                    log_in_row = True
-                    if self._intersects(char_box, box):
-                        on_log = True
-        return log_in_row and not on_log
-
-    @staticmethod
-    def _intersects(a, b) -> bool:
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        return ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1
+class LaneType(Enum):
+    ROAD = "road"
+    WATER = "water"
+    GRASS = "grass"
 
 
-class CharStateMachine:
-    """Two-state machine driven directly off `_active_anims`. STATIONARY
-    when no hop is in flight (planner is allowed to issue a move);
-    MOVING while any animation is active (planner is muted)."""
+@dataclass
+class LaneClassification:
+    y0: int
+    y1: int
+    lane_type: LaneType
+    gray_px: int
+    blue_px: int
+    ignored_spans: list[tuple[int, int]]
 
-    STATIONARY = "stationary"
-    MOVING     = "moving"
 
-    def __init__(self, anims: list):
-        self._anims = anims
-        self.state  = self.STATIONARY
+def _lane_bands(frame_h: int, lane_h: int, offset: float) -> list[tuple[int, int]]:
+    lane_h = max(2, int(lane_h))
+    y = int(round(offset)) % lane_h
+    while y > 0:
+        y -= lane_h
+    bands: list[tuple[int, int]] = []
+    while y < frame_h:
+        y0 = max(0, y)
+        y1 = min(frame_h, y + lane_h - _GRID_LANE_MARGIN)
+        if y1 > y0:
+            bands.append((y0, y1))
+        y += lane_h
+    return bands
 
-    def is_stationary(self) -> bool:
-        self.state = self.STATIONARY if not self._anims else self.MOVING
-        return self.state == self.STATIONARY
+
+class LaneAssignmentSmoother:
+    def __init__(self, window_frames: int = _LANE_ASSIGNMENT_MODE_FRAMES):
+        self.window_frames = max(1, int(window_frames))
+        self._history: dict = {}
+        self._last_seen: dict = {}
 
     def reset(self) -> None:
-        self.state = self.STATIONARY
+        self._history.clear()
+        self._last_seen.clear()
+
+    @staticmethod
+    def _raw_lane_index(bands: list[tuple[int, int]], bbox: list,
+                        y_offset: float = 0.0) -> Optional[int]:
+        _x1, y1, _x2, y2 = bbox
+        cy = (float(y1) + float(y2)) / 2.0 + float(y_offset)
+        for i, (lane_y0, lane_y1) in enumerate(bands):
+            if lane_y0 <= cy < lane_y1:
+                return i
+        return None
+
+    def lane_index(self, key, bands: list[tuple[int, int]], bbox: list,
+                   frame_idx: int, y_offset: float = 0.0) -> Optional[int]:
+        raw = self._raw_lane_index(bands, bbox, y_offset)
+        if raw is None:
+            return None
+
+        hist = self._history.setdefault(key, deque(maxlen=self.window_frames))
+        hist.append(raw)
+        self._last_seen[key] = frame_idx
+
+        counts = Counter(hist)
+        best_count = max(counts.values())
+        candidates = {lane for lane, count in counts.items() if count == best_count}
+        for lane in reversed(hist):
+            if lane in candidates:
+                return lane
+        return raw
+
+    def prune(self, frame_idx: int) -> None:
+        stale_after = self.window_frames * 3
+        stale = [key for key, seen in self._last_seen.items()
+                 if frame_idx - seen > stale_after]
+        for key in stale:
+            self._history.pop(key, None)
+            self._last_seen.pop(key, None)
+
+
+def _lane_color_masks(frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2Lab)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    lab_a = lab[..., 1].astype(np.float32)
+    lab_b = lab[..., 2].astype(np.float32)
+
+    gray_hsv = ((h >= 95) & (h <= 135) & (s <= 80) &
+                (v >= 80) & (v <= 130))
+    da = np.abs(lab_a - 128.0)
+    db = np.abs(lab_b - 128.0)
+    chroma = np.sqrt((lab_a - 128.0) ** 2 + (lab_b - 128.0) ** 2)
+    gray_lab = (da <= 10.0) & (db <= 12.0) & (chroma <= 16.0)
+    gray = (gray_hsv & gray_lab).astype(np.uint8) * 255
+
+    blue_hsv = ((h >= 95) & (h <= 110) & (s >= 100) & (v >= 200))
+    blue_lab = lab[..., 2] <= 125
+    blue = (blue_hsv & blue_lab).astype(np.uint8) * 255
+
+    k = np.ones((3, 3), np.uint8)
+    gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, k, iterations=1)
+    gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, k, iterations=1)
+    blue = cv2.morphologyEx(blue, cv2.MORPH_OPEN, k, iterations=1)
+    blue = cv2.morphologyEx(blue, cv2.MORPH_CLOSE, k, iterations=1)
+    return gray, blue
+
+
+def classify_lanes(frame_bgr: np.ndarray, lane_h: int,
+                   offset: Optional[float],
+                   bboxes: Optional[list] = None,
+                   track_ids: Optional[list] = None,
+                   class_ids: Optional[list] = None,
+                   lane_smoother: Optional[LaneAssignmentSmoother] = None,
+                   frame_idx: int = 0,
+                   log_y_offset: int = 0) -> list[LaneClassification]:
+    if offset is None:
+        return []
+    gray, blue = _lane_color_masks(frame_bgr)
+    x0, x1 = _GRID_X_RANGE
+    bands = _lane_bands(frame_bgr.shape[0], lane_h, offset)
+    ignored_by_band: list[list[tuple[int, int]]] = [[] for _ in bands]
+    if bboxes:
+        track_ids = track_ids or [None] * len(bboxes)
+        class_ids = class_ids or [None] * len(bboxes)
+        for det_idx, (bbox, tid, cls) in enumerate(zip(bboxes, track_ids, class_ids)):
+            lane_idx = None
+            y_offset = log_y_offset if cls == LOG_CLASS_ID else 0
+            if lane_smoother is not None:
+                key = ("track", int(tid)) if tid is not None else ("det", det_idx)
+                lane_idx = lane_smoother.lane_index(
+                    key, bands, bbox, frame_idx, y_offset
+                )
+            else:
+                lane_idx = LaneAssignmentSmoother._raw_lane_index(
+                    bands, bbox, y_offset
+                )
+            if lane_idx is None or lane_idx >= len(ignored_by_band):
+                continue
+
+            bx1, _by1, bx2, _by2 = bbox
+            ix0 = max(0, min(frame_bgr.shape[1], int(math.floor(bx1))))
+            ix1 = max(0, min(frame_bgr.shape[1], int(math.ceil(bx2))))
+            if ix1 > ix0:
+                ignored_by_band[lane_idx].append((ix0, ix1))
+
+    out: list[LaneClassification] = []
+    for i, (y0, y1) in enumerate(bands):
+        ys = max(y0, _GRID_Y_RANGE[0])
+        ye = min(y1, _GRID_Y_RANGE[1])
+        if ye <= ys:
+            continue
+        gray_roi = gray[ys:ye, x0:x1].copy()
+        blue_roi = blue[ys:ye, x0:x1].copy()
+        for ix0, ix1 in ignored_by_band[i]:
+            rx0 = max(0, ix0 - x0)
+            rx1 = min(x1 - x0, ix1 - x0)
+            if rx1 > rx0:
+                gray_roi[:, rx0:rx1] = 0
+                blue_roi[:, rx0:rx1] = 0
+        gray_px = int(cv2.countNonZero(gray_roi))
+        blue_px = int(cv2.countNonZero(blue_roi))
+        if gray_px >= _LANE_COLOR_MIN_PIXELS:
+            lane_type = LaneType.ROAD
+        elif blue_px >= _LANE_COLOR_MIN_PIXELS:
+            lane_type = LaneType.WATER
+        else:
+            lane_type = LaneType.GRASS
+        out.append(LaneClassification(
+            y0, y1, lane_type, gray_px, blue_px, ignored_by_band[i]
+        ))
+    return out
+
+
+def draw_lane_classifications(frame: np.ndarray,
+                              lanes: list[LaneClassification]) -> None:
+    colors = {
+        LaneType.ROAD:  (120, 120, 120),
+        LaneType.WATER: (255, 120, 0),
+        LaneType.GRASS: (60, 180, 60),
+    }
+    overlay = frame.copy()
+    for lane in lanes:
+        color = colors[lane.lane_type]
+        cv2.rectangle(overlay, (0, lane.y0), (W, lane.y1), color, -1)
+    cv2.addWeighted(overlay, 0.18, frame, 0.82, 0.0, dst=frame)
+
+    ignored_overlay = frame.copy()
+    for lane in lanes:
+        for x0, x1 in lane.ignored_spans:
+            cv2.rectangle(ignored_overlay, (x0, lane.y0), (x1, lane.y1),
+                          (95, 95, 95), -1)
+    cv2.addWeighted(ignored_overlay, 0.55, frame, 0.45, 0.0, dst=frame)
+
+    for lane in lanes:
+        color = colors[lane.lane_type]
+        for x0, x1 in lane.ignored_spans:
+            cv2.rectangle(frame, (x0, lane.y0), (x1, lane.y1),
+                          (190, 190, 190), 1)
+        cy = (lane.y0 + lane.y1) // 2
+        text = f"{lane.lane_type.value} g={lane.gray_px} b={lane.blue_px}"
+        cv2.putText(frame, text, (5, max(12, cy + 4)),
+                    0, 0.35, color, 1, cv2.LINE_AA)
 
 
 def main():
@@ -951,10 +956,9 @@ def main():
     vtrack     = VelocityTracker()
     gridscroll = GridScrollEstimator()
     hxscroll   = HorizontalScrollEstimator()
+    lane_smoother = LaneAssignmentSmoother()
     char_fx    = _OneEuro1D(mincutoff=1.0, beta=0.05)
     char_fy    = _OneEuro1D(mincutoff=1.0, beta=0.05)
-    planner    = Planner()
-    state_machine = CharStateMachine(_active_anims)
     gameover   = GameOverDetector()
     cv2.namedWindow("Detections")
     cv2.setMouseCallback("Detections", _on_mouse)
@@ -975,6 +979,8 @@ def main():
     cv2.setTrackbarMin("sobel_th", "Detections", 1)
     cv2.createTrackbar("grid_start", "Detections", gridscroll.start_offset, 40, _on_grid_start)
     cv2.createTrackbar("grid_shift", "Detections", 0, 20, lambda v: None)
+    cv2.createTrackbar("log_y_offset", "Detections",
+                       LOG_LANE_Y_OFFSET_DEFAULT + 40, 80, lambda v: None)
     cv2.createTrackbar("shift_x",    "Detections", 91, 200, lambda v: None)
     input("Press Enter to start detection… ")
     print("Streaming — press q to quit.")
@@ -987,8 +993,8 @@ def main():
         show_sobel   = False
         show_sobx    = False
         show_hx      = False
-        show_plan    = True
-        minimal_mode = True   # h: hide all overlays except A* plan
+        show_detections = False
+        minimal_mode = True   # h: hide all overlays
         prev_cum_y   = 0.0
         red_offset_x: float                          = 0.0
         red_offset_y: float                          = 0.0
@@ -1009,6 +1015,7 @@ def main():
             gridscroll.cum_scroll_y = 0.0
             gridscroll.prev_offset = None
             gridscroll.set_start_offset(cv2.getTrackbarPos("grid_start", "Detections"))
+            lane_smoother.reset()
             prev_cum_y = 0.0
             char_fx.reset()
             char_fy.reset()
@@ -1017,7 +1024,6 @@ def main():
             prev_green_xy = None
             prev_raw_green_xy = None
             green_glitch_count = 0
-            state_machine.reset()
             gameover.reset()
 
         while True:
@@ -1031,7 +1037,7 @@ def main():
                 verbose=False,
             )
 
-            annotated = frame.copy() if minimal_mode else results[0].plot()
+            annotated = results[0].plot() if show_detections else frame.copy()
 
             # Mirror ultralytics Annotator font metrics so text aligns with labels
             lw  = max(round(sum(annotated.shape) / 2 * 0.003), 2)
@@ -1073,6 +1079,11 @@ def main():
             ref_x = cx0 + btn_x
             ref_y = cy0 + btn_y
             world_scroll_y = gridscroll.update(frame, xyxys)
+            log_y_offset = cv2.getTrackbarPos("log_y_offset", "Detections") - 40
+            lane_classes = classify_lanes(frame, gridscroll.lane_h,
+                                          gridscroll.prev_offset, xyxys,
+                                          id_list, cls_list, lane_smoother,
+                                          frame_count, log_y_offset)
 
             # Horizontal scroll from inter-frame vertical-edge cross-correlation.
             if abs(gridscroll.cum_scroll_y - prev_cum_y) >= _GRID_JUMP_CLAMP:
@@ -1081,8 +1092,8 @@ def main():
             hxscroll.update(frame, xyxys)
             hx_now = hxscroll.cum_scroll_x
 
-            # Per-track velocity (world-frame, camera-corrected) + planner list.
-            objs_for_planner: list = []
+            # Per-track velocity (world-frame, camera-corrected).
+            objs_for_frame: list = []
             for tid, cls, (x1, y1, x2, y2) in zip(id_list, cls_list, xyxys):
                 v: float = 0.0
                 if tid is not None:
@@ -1098,7 +1109,7 @@ def main():
                             cv2.putText(annotated, txt,
                                         (tx, ty), 0, vsf,
                                         (0, 255, 255), vtf, cv2.LINE_AA)
-                objs_for_planner.append({
+                objs_for_frame.append({
                     "bbox": (x1, y1, x2, y2),
                     "vx":   v,
                     "vy":   0.0,
@@ -1164,7 +1175,7 @@ def main():
                 red_xy=(red_pred_x + red_offset_x,
                         red_pred_y + red_offset_y),
                 truth_xy=truth_xy,
-                objects=objs_for_planner,
+                objects=objs_for_frame,
             )
 
             # TEMP: game-over flow disabled
@@ -1183,46 +1194,12 @@ def main():
                     reset_run()
                     send_game_over_recovery()
                     pause_until = None
-            elif state_machine.is_stationary():
-                move = planner.plan(truth_xy, objs_for_planner)
-                if move is not None:
-                    send_direction(move)
-
-            if show_plan and getattr(planner, "last_origin", None) is not None:
-                ox, oy = planner.last_origin
-                ad     = ANIM_DIST
-                ph     = planner.char_size // 2
-                # Explored states (dim blue dots)
-                for nx, ny, _depth in planner.last_explored:
-                    cv2.circle(annotated,
-                               (int(round(ox + nx * ad)),
-                                int(round(oy + ny * ad))),
-                               2, (200, 100, 0), -1)
-                # Chosen path (cyan if goal reached, dim cyan if partial)
-                path = planner.last_path
-                path_color = (0, 255, 255) if planner.last_goal_reached else (0, 180, 180)
-                prev_pt = None
-                for i, (nx, ny) in enumerate(path):
-                    cx = int(round(ox + nx * ad))
-                    cy = int(round(oy + ny * ad))
-                    thick = 2 if i == 1 else 1   # bold the immediate next step
-                    cv2.rectangle(annotated,
-                                  (cx - ph, cy - ph),
-                                  (cx + ph, cy + ph),
-                                  path_color, thick)
-                    if prev_pt is not None:
-                        cv2.line(annotated, prev_pt, (cx, cy), path_color, 1)
-                    prev_pt = (cx, cy)
-                # First-move tag
-                fm = planner.last_first_move or "wait"
-                tag = f"plan: {fm}{' ✓' if planner.last_goal_reached else ' …'}"
-                cv2.putText(annotated, tag, (5, 50),
-                            0, 0.4, path_color, 1, cv2.LINE_AA)
 
             if not minimal_mode and show_grid and gridscroll.prev_offset is not None:
                 lh = gridscroll.lane_h
                 m  = _GRID_LANE_MARGIN
                 shift = cv2.getTrackbarPos("grid_shift", "Detections")
+                draw_lane_classifications(annotated, lane_classes)
                 y0_grid = (int(round(gridscroll.prev_offset)) + shift) % lh
                 for y in range(y0_grid, H, lh):
                     cv2.line(annotated, (0, y), (W, y), (0, 255, 0), 1)
@@ -1230,7 +1207,7 @@ def main():
                     if yb < H and yb != y:
                         cv2.line(annotated, (0, yb), (W, yb), (0, 200, 0), 1)
                 cv2.putText(annotated,
-                            f"scroll={gridscroll.cum_scroll_y:+.2f} o={gridscroll.prev_offset:.2f} h={lh} start={gridscroll.start_offset} s={shift}",
+                            f"scroll={gridscroll.cum_scroll_y:+.2f} o={gridscroll.prev_offset:.2f} h={lh} start={gridscroll.start_offset} log_y={log_y_offset:+d} s={shift}",
                             (5, 15), 0, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
 
             if not minimal_mode and show_hx:
@@ -1249,6 +1226,7 @@ def main():
                 torch.mps.empty_cache()
             if frame_count % 30 == 0:
                 vtrack.prune(frame_count)
+                lane_smoother.prune(frame_count)
 
             if not minimal_mode:
                 _draw_buttons(annotated)
@@ -1289,10 +1267,10 @@ def main():
                 show_sobx = not show_sobx
                 if not show_sobx:
                     cv2.destroyWindow("SobelX")
+            elif key == ord("d"):
+                show_detections = not show_detections
             elif key == ord("h"):
                 minimal_mode = not minimal_mode
-            elif key == ord("p"):
-                show_plan = not show_plan
             elif key == ord("r"):
                 reset_run()
                 pause_until = None
