@@ -950,6 +950,7 @@ class LaneClassification:
     gray_px: int
     blue_px: int
     ignored_spans: list[tuple[int, int]]
+    assigned_objects: list[dict]
 
 
 def _lane_bands(frame_h: int, lane_h: int, offset: float,
@@ -1059,6 +1060,7 @@ def classify_lanes(frame_bgr: np.ndarray, lane_h: int,
     x0, x1 = _GRID_X_RANGE
     bands = _lane_bands(frame_bgr.shape[0], lane_h, offset, lane_margin)
     ignored_by_band: list[list[tuple[int, int]]] = [[] for _ in bands]
+    assigned_by_band: list[list[dict]] = [[] for _ in bands]
     if bboxes:
         track_ids = track_ids or [None] * len(bboxes)
         class_ids = class_ids or [None] * len(bboxes)
@@ -1082,6 +1084,14 @@ def classify_lanes(frame_bgr: np.ndarray, lane_h: int,
             ix1 = max(0, min(frame_bgr.shape[1], int(math.ceil(bx2))))
             if ix1 > ix0:
                 ignored_by_band[lane_idx].append((ix0, ix1))
+                assigned_by_band[lane_idx].append({
+                    "x0": float(ix0),
+                    "x1": float(ix1),
+                    "band_idx": int(lane_idx),
+                    "cls": int(cls) if cls is not None else -1,
+                    "id": int(tid) if tid is not None else None,
+                    "det_idx": det_idx,
+                })
 
     out: list[LaneClassification] = []
     visible_band_count = sum(
@@ -1113,7 +1123,8 @@ def classify_lanes(frame_bgr: np.ndarray, lane_h: int,
         else:
             lane_type = LaneType.GRASS
         out.append(LaneClassification(
-            display_idx, y0, y1, lane_type, gray_px, blue_px, ignored_by_band[i]
+            display_idx, y0, y1, lane_type, gray_px, blue_px,
+            ignored_by_band[i], assigned_by_band[i]
         ))
     return out
 
@@ -1157,6 +1168,270 @@ def draw_lane_assigned_boxes(frame: np.ndarray,
                           (190, 190, 190), 1)
 
 
+PLANNER_DEPTH = 4
+PLANNER_ACTION_DT = ANIM_DURATION
+PLANNER_PLAYER_HALF_W_FRAC = 0.36
+PLANNER_EDGE_MARGIN = 10.0
+PLANNER_MIN_ACTION_INTERVAL = ANIM_DURATION * 0.85
+PLANNER_SEND_KEYS = False
+_PLANNER_ACTIONS = ("up", "left", "right", "down", "stay")
+_PLANNER_DELTAS = {
+    "up": (0.0, -1.0),
+    "down": (0.0, 1.0),
+    "left": (-1.0, 0.0),
+    "right": (1.0, 0.0),
+    "stay": (0.0, 0.0),
+}
+
+
+@dataclass
+class PlannerObject:
+    lane_idx: int
+    x0: float
+    x1: float
+    vx: float
+    cls: int
+
+
+@dataclass
+class PlannerDecision:
+    action: str
+    score: float
+    state: Optional[list[int]]
+    safe_actions: dict[str, bool]
+
+
+class GameTreePlanner:
+    """Small CV-backed game-tree planner inspired by Crossy-Road-AI's minimax.
+
+    The Unity version simulates exact colliders. Here we mirror the idea with
+    screen-space lane bands, assigned object spans, and measured velocities.
+    """
+
+    def __init__(self, depth: int = PLANNER_DEPTH,
+                 action_dt: float = PLANNER_ACTION_DT):
+        self.depth = max(1, int(depth))
+        self.action_dt = float(action_dt)
+
+    @staticmethod
+    def _lane_for_y(lanes: list[LaneClassification],
+                    y: float) -> Optional[LaneClassification]:
+        if not lanes:
+            return None
+        for lane in lanes:
+            if lane.y0 <= y < lane.y1:
+                return lane
+        return min(lanes, key=lambda lane: abs(((lane.y0 + lane.y1) / 2.0) - y))
+
+    @staticmethod
+    def _lane_by_idx(lanes: list[LaneClassification],
+                     idx: int) -> Optional[LaneClassification]:
+        for lane in lanes:
+            if lane.idx == idx:
+                return lane
+        return None
+
+    def _objects_for_lane(self, lane: LaneClassification,
+                          objects: list[PlannerObject]) -> list[PlannerObject]:
+        return [obj for obj in objects if obj.lane_idx == lane.idx]
+
+    @staticmethod
+    def _span_overlaps_tile(obj: PlannerObject, x: float, lane_h: float,
+                            t: float) -> bool:
+        half_w = lane_h * PLANNER_PLAYER_HALF_W_FRAC
+        ox0 = obj.x0 + obj.vx * t
+        ox1 = obj.x1 + obj.vx * t
+        return x - half_w < ox1 and x + half_w > ox0
+
+    def _tile_status(self, x: float, y: float, lane_h: float,
+                     lanes: list[LaneClassification],
+                     objects: list[PlannerObject], t: float
+                     ) -> tuple[bool, LaneType, float]:
+        if x < PLANNER_EDGE_MARGIN or x > W - PLANNER_EDGE_MARGIN:
+            return False, LaneType.GRASS, 0.0
+
+        lane = self._lane_for_y(lanes, y)
+        if lane is None:
+            return False, LaneType.GRASS, 0.0
+
+        lane_objects = self._objects_for_lane(lane, objects)
+
+        if lane.lane_type == LaneType.WATER:
+            best_log_vx = 0.0
+            for obj in lane_objects:
+                if obj.cls == LOG_CLASS_ID and self._span_overlaps_tile(
+                        obj, x, lane_h, t):
+                    best_log_vx = obj.vx
+                    return True, lane.lane_type, best_log_vx
+            return False, lane.lane_type, 0.0
+
+        if lane.lane_type == LaneType.ROAD:
+            for obj in lane_objects:
+                if obj.cls != LOG_CLASS_ID and self._span_overlaps_tile(
+                        obj, x, lane_h, t):
+                    return False, lane.lane_type, 0.0
+
+        return True, lane.lane_type, 0.0
+
+    def _state_vector(self, x: float, y: float, lane_h: float,
+                      lanes: list[LaneClassification],
+                      objects: list[PlannerObject]) -> Optional[list[int]]:
+        curr_lane = self._lane_for_y(lanes, y)
+        if curr_lane is None:
+            return None
+
+        state: list[int] = []
+        checks = [
+            (-1, -1), (0, -1), (1, -1),
+            (-1, 0), (1, 0),
+            (-1, 1), (0, 1), (1, 1),
+        ]
+        for dx, dy in checks:
+            safe, _lane_type, _log_vx = self._tile_status(
+                x + dx * lane_h, y + dy * lane_h, lane_h, lanes, objects,
+                self.action_dt
+            )
+            state.append(0 if safe else 1)
+
+        for rel in (-1, 0, 1):
+            lane = self._lane_by_idx(lanes, curr_lane.idx - rel)
+            lane_type = lane.lane_type if lane is not None else LaneType.GRASS
+            state.append({
+                LaneType.GRASS: 0,
+                LaneType.ROAD: 1,
+                LaneType.WATER: 2,
+            }[lane_type])
+
+        for rel in (-1, 0, 1):
+            lane = self._lane_by_idx(lanes, curr_lane.idx - rel)
+            if lane is None:
+                state.append(0)
+                continue
+            lane_objs = self._objects_for_lane(lane, objects)
+            if not lane_objs:
+                state.append(0)
+            else:
+                mean_vx = sum(obj.vx for obj in lane_objs) / len(lane_objs)
+                state.append(1 if mean_vx > 1.0 else -1 if mean_vx < -1.0 else 0)
+
+        return state
+
+    def _score_terminal(self, x: float, y: float, start_y: float,
+                        lane_h: float, lane_type: LaneType) -> float:
+        progress = (start_y - y) / lane_h
+        center_penalty = abs(x - W / 2.0) / max(W / 2.0, 1.0)
+        lane_bonus = {
+            LaneType.GRASS: 5.0,
+            LaneType.ROAD: 0.0,
+            LaneType.WATER: -1.0,
+        }[lane_type]
+        return progress * 100.0 - center_penalty * 8.0 + lane_bonus
+
+    def _recurse(self, x: float, y: float, depth: int, elapsed: float,
+                 start_y: float, lane_h: float,
+                 lanes: list[LaneClassification],
+                 objects: list[PlannerObject]) -> float:
+        safe, lane_type, log_vx = self._tile_status(
+            x, y, lane_h, lanes, objects, elapsed
+        )
+        if not safe:
+            return -100000.0 - depth
+        if depth <= 0:
+            return self._score_terminal(x, y, start_y, lane_h, lane_type)
+
+        if lane_type == LaneType.WATER:
+            x += log_vx * self.action_dt
+
+        best = -1000000.0
+        for action in _PLANNER_ACTIONS:
+            dx, dy = _PLANNER_DELTAS[action]
+            nx = x + dx * lane_h
+            ny = y + dy * lane_h
+            score = self._recurse(
+                nx, ny, depth - 1, elapsed + self.action_dt,
+                start_y, lane_h, lanes, objects
+            )
+            if action == "up":
+                score += 6.0
+            elif action == "down":
+                score -= 12.0
+            elif action == "stay":
+                score -= 5.0
+            if score > best:
+                best = score
+        return best
+
+    def choose(self, truth_xy: tuple[float, float],
+               lanes: list[LaneClassification],
+               objects_for_frame: list[dict],
+               lane_h: int) -> PlannerDecision:
+        lane_h_f = float(max(2, lane_h))
+        x, y = map(float, truth_xy)
+        by_id = {
+            int(obj["id"]): obj for obj in objects_for_frame
+            if obj.get("id") is not None
+        }
+        by_det_idx = {
+            i: obj for i, obj in enumerate(objects_for_frame)
+            if obj.get("id") is None
+        }
+        objects: list[PlannerObject] = []
+        for lane in lanes:
+            for assigned in lane.assigned_objects:
+                src = None
+                if assigned.get("id") is not None:
+                    src = by_id.get(int(assigned["id"]))
+                if src is None:
+                    src = by_det_idx.get(int(assigned.get("det_idx", -1)))
+                objects.append(PlannerObject(
+                    lane_idx=lane.idx,
+                    x0=float(assigned["x0"]),
+                    x1=float(assigned["x1"]),
+                    vx=float(src.get("vx", 0.0)) if src is not None else 0.0,
+                    cls=int(assigned.get("cls", -1)),
+                ))
+
+        state = self._state_vector(x, y, lane_h_f, lanes, objects)
+        safe_actions: dict[str, bool] = {}
+        best_action = "stay"
+        best_score = -1000000.0
+        for action in _PLANNER_ACTIONS:
+            dx, dy = _PLANNER_DELTAS[action]
+            nx = x + dx * lane_h_f
+            ny = y + dy * lane_h_f
+            safe, _lane_type, _log_vx = self._tile_status(
+                nx, ny, lane_h_f, lanes, objects, self.action_dt
+            )
+            safe_actions[action] = safe
+            score = self._recurse(
+                nx, ny, self.depth - 1, self.action_dt,
+                y, lane_h_f, lanes, objects
+            )
+            if action == "up":
+                score += 6.0
+            elif action == "down":
+                score -= 12.0
+            elif action == "stay":
+                score -= 5.0
+            if score > best_score:
+                best_score = score
+                best_action = action
+
+        return PlannerDecision(best_action, best_score, state, safe_actions)
+
+
+def draw_planner_decision(frame: np.ndarray,
+                          decision: PlannerDecision,
+                          auto_enabled: bool) -> None:
+    status = "auto" if auto_enabled else "advice"
+    safe = "".join(
+        name[0].upper() if ok else name[0].lower()
+        for name, ok in decision.safe_actions.items()
+    )
+    text = f"planner {status}: {decision.action} score={decision.score:.0f} safe={safe}"
+    cv2.putText(frame, text, (5, 31), 0, 0.4, (0, 220, 255), 1, cv2.LINE_AA)
+
+
 def main():
     global _run_logger
     _run_logger = RunLogger()
@@ -1175,6 +1450,7 @@ def main():
     char_fx    = _OneEuro1D(mincutoff=1.0, beta=0.05)
     char_fy    = _OneEuro1D(mincutoff=1.0, beta=0.05)
     gameover   = GameOverDetector()
+    planner    = GameTreePlanner()
     cv2.namedWindow("Detections")
     cv2.setMouseCallback("Detections", _on_mouse)
     def _on_lane_h(v):
@@ -1213,8 +1489,11 @@ def main():
         show_sobel   = False
         show_sobx    = False
         show_hx      = False
+        show_boxes   = False
         show_detections = False
         minimal_mode = True   # h: hide all overlays
+        planner_auto = PLANNER_SEND_KEYS
+        last_planner_action_ts = 0.0
         prev_cum_y   = 0.0
         lane_idx_base = 0
         offset_cycle_history = deque(maxlen=_LANE_OFFSET_DROP_WINDOW)
@@ -1232,6 +1511,7 @@ def main():
             nonlocal lane_idx_base, offset_cycle_armed, prev_cycle_x
             nonlocal red_offset_x, red_offset_y
             nonlocal prev_green_xy, prev_raw_green_xy, green_glitch_count
+            nonlocal last_planner_action_ts
             settled_x = 0.0
             settled_y = 0.0
             _active_anims.clear()
@@ -1255,6 +1535,7 @@ def main():
             prev_green_xy = None
             prev_raw_green_xy = None
             green_glitch_count = 0
+            last_planner_action_ts = 0.0
             gameover.reset()
 
         while True:
@@ -1357,6 +1638,9 @@ def main():
                     vv = vtrack.velocity(tid, cam_x_now=hxscroll.cum_scroll_x)
                     if vv is not None:
                         v = vv
+                if not minimal_mode and show_boxes:
+                    cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)),
+                                  (0, 255, 255), lw)
                 if not minimal_mode:
                     box_color = (0, 255, 255)
                     txt = f"v={v:+.0f}"
@@ -1378,6 +1662,9 @@ def main():
             for obj in missing_kalman_objects:
                 x1, y1, x2, y2 = obj.bbox
                 v = obj.vx + hxscroll.last_shift * MAX_FPS
+                if not minimal_mode and show_boxes:
+                    cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)),
+                                  (160, 160, 160), lw)
                 if not minimal_mode:
                     box_color = (160, 160, 160)
                     txt = f"kf {obj.tid if obj.tid is not None else '-'} v={v:+.0f} pred"
@@ -1449,6 +1736,23 @@ def main():
             if not minimal_mode:
                 cv2.rectangle(annotated, (tx - 11, ty - 11),
                               (tx + 10, ty + 10), (0, 255, 255), 1)
+
+            planner_decision: Optional[PlannerDecision] = None
+            if lane_classes:
+                planner_decision = planner.choose(
+                    truth_xy, lane_classes, objs_for_frame, gridscroll.lane_h
+                )
+                if not minimal_mode:
+                    draw_planner_decision(annotated, planner_decision, planner_auto)
+
+                ready_for_action = (
+                    not _active_anims and
+                    now - last_planner_action_ts >= PLANNER_MIN_ACTION_INTERVAL
+                )
+                if (planner_auto and ready_for_action and
+                        planner_decision.action != "stay"):
+                    send_direction(planner_decision.action)
+                    last_planner_action_ts = now
 
             _run_logger.log_frame(
                 green_xy=green_xy,
@@ -1551,10 +1855,17 @@ def main():
                 show_sobx = not show_sobx
                 if not show_sobx:
                     cv2.destroyWindow("SobelX")
+            elif key == ord("b"):
+                show_boxes = not show_boxes
+                if show_boxes:
+                    minimal_mode = False
             elif key == ord("d"):
                 show_detections = not show_detections
             elif key == ord("h"):
                 minimal_mode = not minimal_mode
+            elif key == ord("a"):
+                planner_auto = not planner_auto
+                print(f"planner auto={'on' if planner_auto else 'off'}")
             elif key == ord("r"):
                 reset_run()
                 pause_until = None
