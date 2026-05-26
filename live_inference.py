@@ -7,7 +7,7 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 import math
 
@@ -18,6 +18,9 @@ from ultralytics import YOLO
 
 PRUNE_AFTER_FRAMES = 30   # match BoT-SORT's track_buffer; once it drops a track, we can too
 EDGE_EPS           = 2    # px tolerance for "bbox edge touches frame border"
+KALMAN_MISSING_FRAMES = 30
+KALMAN_PROCESS_VAR = 35.0
+KALMAN_MEAS_VAR = 16.0
 
 
 @dataclass
@@ -37,6 +40,9 @@ class _TrackState:
 class VelocityTracker:
     def __init__(self):
         self._tracks: dict = {}
+
+    def reset(self) -> None:
+        self._tracks.clear()
 
     def update(self, tid: int, x1: float, y1: float, x2: float, y2: float,
                ts: float, frame_idx: int, cam_x: float = 0.0):
@@ -104,6 +110,190 @@ class VelocityTracker:
             del self._tracks[tid]
 
 
+@dataclass
+class _KalmanTrack:
+    state: np.ndarray
+    cov: np.ndarray
+    cls: int
+    w: float
+    h: float
+    last_ts: float
+    last_seen_frame: int
+    last_update_frame: int
+
+
+@dataclass
+class TrackedObject:
+    tid: Optional[int]
+    cls: int
+    bbox: tuple[float, float, float, float]
+    vx: float
+    vy: float
+    predicted: bool
+
+
+class MovingObjectKalmanTracker:
+    """Constant-velocity Kalman tracker over bbox center.
+
+    State is [cx, cy, vx, vy]. Bbox width/height are side data used only
+    for drawing/masking. Tracks keep predicting for a short window after
+    detections disappear, then update when the same track id reappears.
+    """
+
+    def __init__(self, max_missing_frames: int = KALMAN_MISSING_FRAMES,
+                 process_var: float = KALMAN_PROCESS_VAR,
+                 meas_var: float = KALMAN_MEAS_VAR):
+        self.max_missing_frames = max(1, int(max_missing_frames))
+        self.process_var = float(process_var)
+        self.meas_var = float(meas_var)
+        self._tracks: dict[int, _KalmanTrack] = {}
+
+    @staticmethod
+    def _measurement(bbox: Union[list, tuple]) -> np.ndarray:
+        x1, y1, x2, y2 = map(float, bbox)
+        return np.array([
+            (x1 + x2) / 2.0,
+            (y1 + y2) / 2.0,
+        ], dtype=np.float64)
+
+    @staticmethod
+    def _bbox_size(bbox: Union[list, tuple]) -> tuple[float, float]:
+        x1, y1, x2, y2 = map(float, bbox)
+        return max(1.0, x2 - x1), max(1.0, y2 - y1)
+
+    @staticmethod
+    def _bbox_from_track(track: _KalmanTrack) -> tuple[float, float, float, float]:
+        cx, cy = track.state[:2]
+        w = max(1.0, float(track.w))
+        h = max(1.0, float(track.h))
+        x1 = float(np.clip(cx - w / 2.0, 0, W))
+        y1 = float(np.clip(cy - h / 2.0, 0, H))
+        x2 = float(np.clip(cx + w / 2.0, 0, W))
+        y2 = float(np.clip(cy + h / 2.0, 0, H))
+        return x1, y1, x2, y2
+
+    def _measurement_for_update(self, track: _KalmanTrack,
+                                bbox: Union[list, tuple]) -> np.ndarray:
+        x1, y1, x2, y2 = map(float, bbox)
+        clipped_left = x1 <= EDGE_EPS
+        clipped_right = x2 >= W - EDGE_EPS
+        if not clipped_left and not clipped_right:
+            return self._measurement((x1, y1, x2, y2))
+
+        track_w = max(1.0, float(track.w))
+        cy = (y1 + y2) / 2.0
+        if clipped_left and not clipped_right:
+            cx = x2 - track_w / 2.0
+        elif clipped_right and not clipped_left:
+            cx = x1 + track_w / 2.0
+        else:
+            cx = float(track.state[0])
+        return np.array([cx, cy], dtype=np.float64)
+
+    def reset(self) -> None:
+        self._tracks.clear()
+
+    def _new_track(self, bbox: Union[list, tuple], cls: int,
+                   ts: float, frame_idx: int) -> _KalmanTrack:
+        z = self._measurement(bbox)
+        w, h = self._bbox_size(bbox)
+        state = np.zeros(4, dtype=np.float64)
+        state[:2] = z
+        cov = np.diag([25.0, 25.0, 400.0, 400.0]).astype(np.float64)
+        return _KalmanTrack(state, cov, int(cls), w, h, ts, frame_idx, frame_idx)
+
+    def _predict_one(self, track: _KalmanTrack, ts: float) -> None:
+        dt = max(min(ts - track.last_ts, 0.25), 1.0 / MAX_FPS)
+        F = np.eye(4, dtype=np.float64)
+        F[0, 2] = dt
+        F[1, 3] = dt
+        q = self.process_var
+        Q = np.diag([
+            q * dt ** 4, q * dt ** 4,
+            q * dt ** 2, q * dt ** 2,
+        ]).astype(np.float64)
+        track.state = F @ track.state
+        track.cov = F @ track.cov @ F.T + Q
+        track.last_ts = ts
+
+    def _update_one(self, track: _KalmanTrack, bbox: Union[list, tuple],
+                    cls: int, frame_idx: int) -> None:
+        x1, _y1, x2, _y2 = map(float, bbox)
+        if x1 > EDGE_EPS and x2 < W - EDGE_EPS:
+            track.w, track.h = self._bbox_size(bbox)
+        else:
+            _w, h = self._bbox_size(bbox)
+            track.h = h
+
+        z = self._measurement_for_update(track, bbox)
+        Hm = np.zeros((2, 4), dtype=np.float64)
+        Hm[0, 0] = Hm[1, 1] = 1.0
+        R = np.eye(2, dtype=np.float64) * self.meas_var
+        y = z - Hm @ track.state
+        S = Hm @ track.cov @ Hm.T + R
+        K = track.cov @ Hm.T @ np.linalg.inv(S)
+        track.state = track.state + K @ y
+        track.cov = (np.eye(4, dtype=np.float64) - K @ Hm) @ track.cov
+        track.cls = int(cls)
+        track.last_seen_frame = frame_idx
+        track.last_update_frame = frame_idx
+
+    def update(self, bboxes: list, class_ids: list, track_ids: list,
+               ts: float, frame_idx: int) -> list[TrackedObject]:
+        for track in self._tracks.values():
+            self._predict_one(track, ts)
+
+        updated: set[int] = set()
+        for det_idx, (bbox, cls, tid) in enumerate(zip(bboxes, class_ids, track_ids)):
+            if tid is None:
+                continue
+            tid = int(tid)
+            track = self._tracks.get(tid)
+            if track is None:
+                track = self._new_track(bbox, cls, ts, frame_idx)
+                self._tracks[tid] = track
+            else:
+                self._update_one(track, bbox, cls, frame_idx)
+            updated.add(tid)
+
+        stale = [tid for tid, track in self._tracks.items()
+                 if frame_idx - track.last_seen_frame > self.max_missing_frames]
+        for tid in stale:
+            del self._tracks[tid]
+
+        out: list[TrackedObject] = []
+        for tid, track in self._tracks.items():
+            if frame_idx - track.last_seen_frame > self.max_missing_frames:
+                continue
+            x1, y1, x2, y2 = self._bbox_from_track(track)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            out.append(TrackedObject(
+                tid=tid,
+                cls=track.cls,
+                bbox=(x1, y1, x2, y2),
+                vx=float(track.state[2]),
+                vy=float(track.state[3]),
+                predicted=tid not in updated,
+            ))
+
+        # Keep untracked detections usable, but they cannot be predicted
+        # through misses without a stable id.
+        for det_idx, (bbox, cls, tid) in enumerate(zip(bboxes, class_ids, track_ids)):
+            if tid is not None:
+                continue
+            x1, y1, x2, y2 = map(float, bbox)
+            out.append(TrackedObject(
+                tid=None,
+                cls=int(cls),
+                bbox=(x1, y1, x2, y2),
+                vx=0.0,
+                vy=0.0,
+                predicted=False,
+            ))
+        return out
+
+
 class _OneEuro1D:
     """One Euro filter (Casiez et al. 2012). Adaptive low-pass where the
     cutoff frequency scales with the magnitude of the estimated derivative:
@@ -146,11 +336,15 @@ class _OneEuro1D:
 
 
 GRID_PERIOD     = 22       # px per lane (one hop = one period)
-_GRID_LANE_MARGIN = 1      # px gap rendered between adjacent lanes
+_GRID_LANE_MARGIN_DEFAULT = 1      # px gap rendered between adjacent lanes
 _GRID_START_OFFSET = 9
 _GRID_X_RANGE   = (20, 180)
 _GRID_Y_RANGE   = (30, 420)
 _GRID_JUMP_CLAMP = 15      # px; |delta| above this is treated as a scene cut
+_LANE_OFFSET_CYCLE_DEFAULT = 22.0
+_LANE_OFFSET_DROP_WINDOW = 8
+_LANE_OFFSET_DROP_FRAC = 0.5
+_LANE_OFFSET_REARM_FRAC = 0.5
 
 
 class HorizontalScrollEstimator:
@@ -749,6 +943,7 @@ class LaneType(Enum):
 
 @dataclass
 class LaneClassification:
+    idx: int
     y0: int
     y1: int
     lane_type: LaneType
@@ -757,15 +952,17 @@ class LaneClassification:
     ignored_spans: list[tuple[int, int]]
 
 
-def _lane_bands(frame_h: int, lane_h: int, offset: float) -> list[tuple[int, int]]:
+def _lane_bands(frame_h: int, lane_h: int, offset: float,
+                lane_margin: int = _GRID_LANE_MARGIN_DEFAULT) -> list[tuple[int, int]]:
     lane_h = max(2, int(lane_h))
+    lane_margin = int(np.clip(lane_margin, 0, lane_h - 1))
     y = int(round(offset)) % lane_h
     while y > 0:
         y -= lane_h
     bands: list[tuple[int, int]] = []
     while y < frame_h:
         y0 = max(0, y)
-        y1 = min(frame_h, y + lane_h - _GRID_LANE_MARGIN)
+        y1 = min(frame_h, y + lane_h - lane_margin)
         if y1 > y0:
             bands.append((y0, y1))
         y += lane_h
@@ -853,12 +1050,14 @@ def classify_lanes(frame_bgr: np.ndarray, lane_h: int,
                    class_ids: Optional[list] = None,
                    lane_smoother: Optional[LaneAssignmentSmoother] = None,
                    frame_idx: int = 0,
-                   log_y_offset: int = 0) -> list[LaneClassification]:
+                   log_y_offset: int = 0,
+                   lane_idx_base: int = 0,
+                   lane_margin: int = _GRID_LANE_MARGIN_DEFAULT) -> list[LaneClassification]:
     if offset is None:
         return []
     gray, blue = _lane_color_masks(frame_bgr)
     x0, x1 = _GRID_X_RANGE
-    bands = _lane_bands(frame_bgr.shape[0], lane_h, offset)
+    bands = _lane_bands(frame_bgr.shape[0], lane_h, offset, lane_margin)
     ignored_by_band: list[list[tuple[int, int]]] = [[] for _ in bands]
     if bboxes:
         track_ids = track_ids or [None] * len(bboxes)
@@ -885,11 +1084,18 @@ def classify_lanes(frame_bgr: np.ndarray, lane_h: int,
                 ignored_by_band[lane_idx].append((ix0, ix1))
 
     out: list[LaneClassification] = []
+    visible_band_count = sum(
+        1 for y0, y1 in bands
+        if min(y1, _GRID_Y_RANGE[1]) > max(y0, _GRID_Y_RANGE[0])
+    )
+    visible_idx = 0
     for i, (y0, y1) in enumerate(bands):
         ys = max(y0, _GRID_Y_RANGE[0])
         ye = min(y1, _GRID_Y_RANGE[1])
         if ye <= ys:
             continue
+        display_idx = lane_idx_base + visible_band_count - visible_idx - 1
+        visible_idx += 1
         gray_roi = gray[ys:ye, x0:x1].copy()
         blue_roi = blue[ys:ye, x0:x1].copy()
         for ix0, ix1 in ignored_by_band[i]:
@@ -907,7 +1113,7 @@ def classify_lanes(frame_bgr: np.ndarray, lane_h: int,
         else:
             lane_type = LaneType.GRASS
         out.append(LaneClassification(
-            y0, y1, lane_type, gray_px, blue_px, ignored_by_band[i]
+            display_idx, y0, y1, lane_type, gray_px, blue_px, ignored_by_band[i]
         ))
     return out
 
@@ -938,9 +1144,17 @@ def draw_lane_classifications(frame: np.ndarray,
             cv2.rectangle(frame, (x0, lane.y0), (x1, lane.y1),
                           (190, 190, 190), 1)
         cy = (lane.y0 + lane.y1) // 2
-        text = f"{lane.lane_type.value} g={lane.gray_px} b={lane.blue_px}"
+        text = f"{lane.idx}: {lane.lane_type.value} g={lane.gray_px} b={lane.blue_px}"
         cv2.putText(frame, text, (5, max(12, cy + 4)),
-                    0, 0.35, color, 1, cv2.LINE_AA)
+                    0, 0.4, color, 1, cv2.LINE_AA)
+
+
+def draw_lane_assigned_boxes(frame: np.ndarray,
+                             lanes: list[LaneClassification]) -> None:
+    for lane in lanes:
+        for x0, x1 in lane.ignored_spans:
+            cv2.rectangle(frame, (x0, lane.y0), (x1, lane.y1),
+                          (190, 190, 190), 1)
 
 
 def main():
@@ -954,6 +1168,7 @@ def main():
     model      = YOLO(MODEL_PATH)
     stream     = FrameStream()
     vtrack     = VelocityTracker()
+    ktrack     = MovingObjectKalmanTracker()
     gridscroll = GridScrollEstimator()
     hxscroll   = HorizontalScrollEstimator()
     lane_smoother = LaneAssignmentSmoother()
@@ -979,8 +1194,13 @@ def main():
     cv2.setTrackbarMin("sobel_th", "Detections", 1)
     cv2.createTrackbar("grid_start", "Detections", gridscroll.start_offset, 40, _on_grid_start)
     cv2.createTrackbar("grid_shift", "Detections", 0, 20, lambda v: None)
+    cv2.createTrackbar("grid_margin", "Detections",
+                       _GRID_LANE_MARGIN_DEFAULT, 10, lambda v: None)
     cv2.createTrackbar("log_y_offset", "Detections",
                        LOG_LANE_Y_OFFSET_DEFAULT + 40, 80, lambda v: None)
+    cv2.createTrackbar("cycle_x", "Detections",
+                       int(round(_LANE_OFFSET_CYCLE_DEFAULT * 10)), 220, lambda v: None)
+    cv2.setTrackbarMin("cycle_x", "Detections", 200)
     cv2.createTrackbar("shift_x",    "Detections", 91, 200, lambda v: None)
     input("Press Enter to start detection… ")
     print("Streaming — press q to quit.")
@@ -996,6 +1216,10 @@ def main():
         show_detections = False
         minimal_mode = True   # h: hide all overlays
         prev_cum_y   = 0.0
+        lane_idx_base = 0
+        offset_cycle_history = deque(maxlen=_LANE_OFFSET_DROP_WINDOW)
+        offset_cycle_armed = False
+        prev_cycle_x = _LANE_OFFSET_CYCLE_DEFAULT
         red_offset_x: float                          = 0.0
         red_offset_y: float                          = 0.0
         prev_green_xy: Optional[tuple[float, float]] = None
@@ -1005,11 +1229,14 @@ def main():
 
         def reset_run():
             nonlocal settled_x, settled_y, prev_cum_y
+            nonlocal lane_idx_base, offset_cycle_armed, prev_cycle_x
             nonlocal red_offset_x, red_offset_y
             nonlocal prev_green_xy, prev_raw_green_xy, green_glitch_count
             settled_x = 0.0
             settled_y = 0.0
             _active_anims.clear()
+            vtrack.reset()
+            ktrack.reset()
             hxscroll.cum_scroll_x = 0.0
             hxscroll.flush()
             gridscroll.cum_scroll_y = 0.0
@@ -1017,6 +1244,10 @@ def main():
             gridscroll.set_start_offset(cv2.getTrackbarPos("grid_start", "Detections"))
             lane_smoother.reset()
             prev_cum_y = 0.0
+            lane_idx_base = 0
+            prev_cycle_x = cv2.getTrackbarPos("cycle_x", "Detections") / 10.0
+            offset_cycle_history.clear()
+            offset_cycle_armed = False
             char_fx.reset()
             char_fy.reset()
             red_offset_x = 0.0
@@ -1037,7 +1268,7 @@ def main():
                 verbose=False,
             )
 
-            annotated = results[0].plot() if show_detections else frame.copy()
+            annotated = frame.copy()
 
             # Mirror ultralytics Annotator font metrics so text aligns with labels
             lw  = max(round(sum(annotated.shape) / 2 * 0.003), 2)
@@ -1057,6 +1288,11 @@ def main():
                             if boxes.cls is not None else [-1] * len(xyxys))
                 id_list  = (boxes.id.int().cpu().tolist()
                             if boxes.id is not None else [None] * len(xyxys))
+            kalman_objects = ktrack.update(xyxys, cls_list, id_list, ts, frame_count)
+            missing_kalman_objects = [obj for obj in kalman_objects if obj.predicted]
+            active_xyxys = list(xyxys) + [obj.bbox for obj in missing_kalman_objects]
+            active_cls_list = list(cls_list) + [obj.cls for obj in missing_kalman_objects]
+            active_id_list = list(id_list) + [obj.tid for obj in missing_kalman_objects]
 
             # Retire finished animations into the settled offset.
             now = time.time()
@@ -1078,42 +1314,86 @@ def main():
             # doesn't depend on the world-scroll value we're trying to estimate.
             ref_x = cx0 + btn_x
             ref_y = cy0 + btn_y
-            world_scroll_y = gridscroll.update(frame, xyxys)
+            world_scroll_y = gridscroll.update(frame, active_xyxys)
             log_y_offset = cv2.getTrackbarPos("log_y_offset", "Detections") - 40
+            grid_margin = min(cv2.getTrackbarPos("grid_margin", "Detections"),
+                              gridscroll.lane_h - 1)
+            cycle_x = cv2.getTrackbarPos("cycle_x", "Detections") / 10.0
+            if abs(cycle_x - prev_cycle_x) > 1e-6:
+                prev_cycle_x = cycle_x
+                offset_cycle_history.clear()
+                offset_cycle_armed = False
+            if gridscroll.prev_offset is not None and cycle_x > 0:
+                current_offset = gridscroll.prev_offset
+                if current_offset > cycle_x * _LANE_OFFSET_REARM_FRAC:
+                    offset_cycle_armed = True
+                if (offset_cycle_armed and offset_cycle_history and
+                        max(offset_cycle_history) - current_offset >
+                        cycle_x * _LANE_OFFSET_DROP_FRAC):
+                    lane_idx_base += 1
+                    offset_cycle_armed = False
+                    offset_cycle_history.clear()
+                offset_cycle_history.append(current_offset)
             lane_classes = classify_lanes(frame, gridscroll.lane_h,
-                                          gridscroll.prev_offset, xyxys,
-                                          id_list, cls_list, lane_smoother,
-                                          frame_count, log_y_offset)
+                                          gridscroll.prev_offset, active_xyxys,
+                                          active_id_list, active_cls_list, lane_smoother,
+                                          frame_count, log_y_offset, lane_idx_base,
+                                          grid_margin)
 
             # Horizontal scroll from inter-frame vertical-edge cross-correlation.
             if abs(gridscroll.cum_scroll_y - prev_cum_y) >= _GRID_JUMP_CLAMP:
                 hxscroll.flush()
             prev_cum_y = gridscroll.cum_scroll_y
-            hxscroll.update(frame, xyxys)
-            hx_now = hxscroll.cum_scroll_x
+            hxscroll.update(frame, active_xyxys)
 
-            # Per-track velocity (world-frame, camera-corrected).
+            # Raw detections use the old velocity tracker. Kalman is kept in
+            # parallel and only contributes objects while detections are missing.
             objs_for_frame: list = []
             for tid, cls, (x1, y1, x2, y2) in zip(id_list, cls_list, xyxys):
                 v: float = 0.0
                 if tid is not None:
-                    vtrack.update(tid, x1, y1, x2, y2, ts, frame_count, cam_x=hx_now)
-                    vv = vtrack.velocity(tid, cam_x_now=hx_now)
+                    vtrack.update(tid, x1, y1, x2, y2, ts, frame_count,
+                                  cam_x=hxscroll.cum_scroll_x)
+                    vv = vtrack.velocity(tid, cam_x_now=hxscroll.cum_scroll_x)
                     if vv is not None:
                         v = vv
-                        if not minimal_mode:
-                            txt = f"v={v:+.0f}"
-                            (tw, th), _ = cv2.getTextSize(txt, 0, vsf, vtf)
-                            tx = int((x1 + x2) / 2) - tw // 2
-                            ty = int((y1 + y2) / 2) + th // 2
-                            cv2.putText(annotated, txt,
-                                        (tx, ty), 0, vsf,
-                                        (0, 255, 255), vtf, cv2.LINE_AA)
+                if not minimal_mode:
+                    box_color = (0, 255, 255)
+                    txt = f"v={v:+.0f}"
+                    (tw, th), _ = cv2.getTextSize(txt, 0, vsf, vtf)
+                    tx = int((x1 + x2) / 2) - tw // 2
+                    ty = int((y1 + y2) / 2) + th // 2
+                    cv2.putText(annotated, txt,
+                                (tx, ty), 0, vsf,
+                                box_color, vtf, cv2.LINE_AA)
                 objs_for_frame.append({
                     "bbox": (x1, y1, x2, y2),
                     "vx":   v,
                     "vy":   0.0,
                     "cls":  cls,
+                    "id":   tid,
+                    "predicted": False,
+                })
+
+            for obj in missing_kalman_objects:
+                x1, y1, x2, y2 = obj.bbox
+                v = obj.vx + hxscroll.last_shift * MAX_FPS
+                if not minimal_mode:
+                    box_color = (160, 160, 160)
+                    txt = f"kf {obj.tid if obj.tid is not None else '-'} v={v:+.0f} pred"
+                    (tw, th), _ = cv2.getTextSize(txt, 0, vsf, vtf)
+                    tx = int((x1 + x2) / 2) - tw // 2
+                    ty = int((y1 + y2) / 2) + th // 2
+                    cv2.putText(annotated, txt,
+                                (tx, ty), 0, vsf,
+                                box_color, vtf, cv2.LINE_AA)
+                objs_for_frame.append({
+                    "bbox": (x1, y1, x2, y2),
+                    "vx":   v,
+                    "vy":   obj.vy,
+                    "cls":  obj.cls,
+                    "id":   obj.tid,
+                    "predicted": True,
                 })
 
             # Morphology detection + One Euro smoothing — green dot is the
@@ -1195,9 +1475,13 @@ def main():
                     send_game_over_recovery()
                     pause_until = None
 
+            if (not minimal_mode and show_detections and
+                    not show_grid and gridscroll.prev_offset is not None):
+                draw_lane_assigned_boxes(annotated, lane_classes)
+
             if not minimal_mode and show_grid and gridscroll.prev_offset is not None:
                 lh = gridscroll.lane_h
-                m  = _GRID_LANE_MARGIN
+                m  = grid_margin
                 shift = cv2.getTrackbarPos("grid_shift", "Detections")
                 draw_lane_classifications(annotated, lane_classes)
                 y0_grid = (int(round(gridscroll.prev_offset)) + shift) % lh
@@ -1207,7 +1491,7 @@ def main():
                     if yb < H and yb != y:
                         cv2.line(annotated, (0, yb), (W, yb), (0, 200, 0), 1)
                 cv2.putText(annotated,
-                            f"scroll={gridscroll.cum_scroll_y:+.2f} o={gridscroll.prev_offset:.2f} h={lh} start={gridscroll.start_offset} log_y={log_y_offset:+d} s={shift}",
+                            f"scroll={gridscroll.cum_scroll_y:+.2f} o={gridscroll.prev_offset:.2f} h={lh} m={m} base={lane_idx_base} X={cycle_x:.1f} start={gridscroll.start_offset} log_y={log_y_offset:+d} s={shift}",
                             (5, 15), 0, 0.4, (0, 255, 0), 1, cv2.LINE_AA)
 
             if not minimal_mode and show_hx:
@@ -1237,7 +1521,7 @@ def main():
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
                 if gridscroll.prev_offset is not None:
                     lh = gridscroll.lane_h
-                    m  = _GRID_LANE_MARGIN
+                    m  = grid_margin
                     shift = cv2.getTrackbarPos("grid_shift", "Detections")
                     y0_grid = (int(round(gridscroll.prev_offset)) + shift) % lh
                     vh, vw = vis.shape[:2]
