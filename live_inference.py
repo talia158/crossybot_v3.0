@@ -17,10 +17,10 @@ import torch
 from ultralytics import YOLO
 
 PRUNE_AFTER_FRAMES = 30   # match BoT-SORT's track_buffer; once it drops a track, we can too
-EDGE_EPS           = 2    # px tolerance for "bbox edge touches frame border"
+EDGE_EPS           = 4    # px tolerance for "bbox edge touches frame border"
 KALMAN_MISSING_FRAMES = 30
-KALMAN_PROCESS_VAR = 35.0
-KALMAN_MEAS_VAR = 16.0
+KALMAN_PROCESS_VAR = 140.0
+KALMAN_MEAS_VAR = 64.0
 
 
 @dataclass
@@ -335,13 +335,13 @@ class _OneEuro1D:
         return x_hat
 
 
-GRID_PERIOD     = 22       # px per lane (one hop = one period)
-_GRID_LANE_MARGIN_DEFAULT = 1      # px gap rendered between adjacent lanes
-_GRID_START_OFFSET = 9
-_GRID_X_RANGE   = (20, 180)
-_GRID_Y_RANGE   = (30, 420)
-_GRID_JUMP_CLAMP = 15      # px; |delta| above this is treated as a scene cut
-_LANE_OFFSET_CYCLE_DEFAULT = 22.0
+GRID_PERIOD     = 44       # px per lane (one hop = one period)
+_GRID_LANE_MARGIN_DEFAULT = 2      # px gap rendered between adjacent lanes
+_GRID_START_OFFSET = 18
+_GRID_X_RANGE   = (40, 360)
+_GRID_Y_RANGE   = (60, 840)
+_GRID_JUMP_CLAMP = 30      # px; |delta| above this is treated as a scene cut
+_LANE_OFFSET_CYCLE_DEFAULT = 44.0
 _LANE_OFFSET_DROP_WINDOW = 8
 _LANE_OFFSET_DROP_FRAC = 0.5
 _LANE_OFFSET_REARM_FRAC = 0.5
@@ -558,7 +558,7 @@ class GridScrollEstimator:
 EMULATOR   = "/Users/talia/Library/Android/sdk/emulator/emulator"
 AVD_NAME   = "Small_Phone"
 MODEL_PATH = "model_weight/model.pt"
-W, H       = 240, 480
+W, H       = 480, 960
 FIFO_PATH  = "/tmp/crossybot_screen.h264"
 MAX_FPS    = 30
 
@@ -697,7 +697,7 @@ def transform_frame(frame: np.ndarray, shift_x: int = 0) -> np.ndarray:
 
 
 YOLO_CONF       = 0.8
-CHAR_INIT_XY    = (223, 315)   # initial centroid of the chicken on screen
+CHAR_INIT_XY    = (446, 630)   # initial centroid of the chicken on screen
 
 # Morphology-based character detector (ported from crossybot_v2.0
 # CharacterTools.detect_character). BGR-threshold the chicken's beak/body
@@ -706,13 +706,13 @@ CHAR_INIT_XY    = (223, 315)   # initial centroid of the chicken on screen
 # the character's feet rather than the colored beak.
 _CHAR_BGR_TARGET   = (92, 172, 255)
 _CHAR_TOL          = 4
-_GREEN_JUMP_THRESH = 30.0  # px/frame; reject morphology jumps above this as glitches
+_GREEN_JUMP_THRESH = 60.0  # px/frame; reject morphology jumps above this as glitches
 _GREEN_GLITCH_LIMIT = 30   # frames; force-accept after this many consecutive rejects
 _CHAR_MIN_AREA_FRAC = 0.0005
 _CHAR_MAX_AREA_FRAC = 0.05
-_CHAR_OPEN_KSZ     = 3
-_CHAR_CLOSE_KSZ    = 5
-_CHAR_Y_SHIFT      = 11
+_CHAR_OPEN_KSZ     = 6
+_CHAR_CLOSE_KSZ    = 10
+_CHAR_Y_SHIFT      = 22
 
 
 def detect_character(bgr: np.ndarray) -> Optional[tuple[int, int]]:
@@ -807,20 +807,20 @@ class GameOverDetector:
 _KEYCODES     = {"up": 19, "down": 20, "left": 21, "right": 22}  # Android KEYCODE_DPAD_*
 SEND_VM_KEYSTROKES = False
 ANIM_DURATION = 0.3   # seconds per button-press animation
-ANIM_DIST     = 22    # px of character displacement per press (= one lane)
+ANIM_DIST     = 44    # px of character displacement per press (= one lane)
 _ANIM_K       = 10.0  # decay rate; 1/k ≈ 0.10 s = time of peak velocity
 _LANE_COLOR_MIN_PIXELS = 1
 _LANE_ASSIGNMENT_MODE_FRAMES = 7
 LOG_CLASS_ID = 2
-LOG_LANE_Y_OFFSET_DEFAULT = 33
+LOG_LANE_Y_OFFSET_DEFAULT = 66
 
 # D-pad button regions (x1, y1, x2, y2) in frame coordinates.
-# Placed in the bottom-right corner of the 240×480 frame.
+# Placed in the bottom-right corner of the 480×960 frame.
 _BTNS: dict[str, tuple[int, int, int, int]] = {
-    "up":    (181, 421, 207, 447),
-    "left":  (152, 450, 178, 476),
-    "down":  (181, 450, 207, 476),
-    "right": (210, 450, 236, 476),
+    "up":    (362, 842, 414, 894),
+    "left":  (304, 900, 356, 952),
+    "down":  (362, 900, 414, 952),
+    "right": (420, 900, 472, 952),
 }
 _BTN_LABELS = {"up": "^", "down": "v", "left": "<", "right": ">"}
 
@@ -1171,7 +1171,7 @@ def draw_lane_assigned_boxes(frame: np.ndarray,
 PLANNER_DEPTH = 4
 PLANNER_ACTION_DT = ANIM_DURATION
 PLANNER_PLAYER_HALF_W_FRAC = 0.36
-PLANNER_EDGE_MARGIN = 10.0
+PLANNER_EDGE_MARGIN = 20.0
 PLANNER_MIN_ACTION_INTERVAL = ANIM_DURATION * 0.85
 PLANNER_SEND_KEYS = False
 _PLANNER_ACTIONS = ("up", "left", "right", "down", "stay")
@@ -1464,20 +1464,20 @@ def main():
     def _on_grid_start(v):
         gridscroll.set_start_offset(v)
 
-    cv2.createTrackbar("lane_h",   "Detections", gridscroll.lane_h, 40, _on_lane_h)
-    cv2.setTrackbarMin("lane_h",   "Detections", 5)
+    cv2.createTrackbar("lane_h",   "Detections", gridscroll.lane_h, 80, _on_lane_h)
+    cv2.setTrackbarMin("lane_h",   "Detections", 10)
     cv2.createTrackbar("sobel_th", "Detections", gridscroll.sobel_thresh, 100, _on_sobel_th)
     cv2.setTrackbarMin("sobel_th", "Detections", 1)
-    cv2.createTrackbar("grid_start", "Detections", gridscroll.start_offset, 40, _on_grid_start)
-    cv2.createTrackbar("grid_shift", "Detections", 0, 20, lambda v: None)
+    cv2.createTrackbar("grid_start", "Detections", gridscroll.start_offset, 80, _on_grid_start)
+    cv2.createTrackbar("grid_shift", "Detections", 0, 40, lambda v: None)
     cv2.createTrackbar("grid_margin", "Detections",
-                       _GRID_LANE_MARGIN_DEFAULT, 10, lambda v: None)
+                       _GRID_LANE_MARGIN_DEFAULT, 20, lambda v: None)
     cv2.createTrackbar("log_y_offset", "Detections",
-                       LOG_LANE_Y_OFFSET_DEFAULT + 40, 80, lambda v: None)
+                       LOG_LANE_Y_OFFSET_DEFAULT + 80, 160, lambda v: None)
     cv2.createTrackbar("cycle_x", "Detections",
-                       int(round(_LANE_OFFSET_CYCLE_DEFAULT * 10)), 220, lambda v: None)
-    cv2.setTrackbarMin("cycle_x", "Detections", 200)
-    cv2.createTrackbar("shift_x",    "Detections", 91, 200, lambda v: None)
+                       int(round(_LANE_OFFSET_CYCLE_DEFAULT * 10)), 440, lambda v: None)
+    cv2.setTrackbarMin("cycle_x", "Detections", 400)
+    cv2.createTrackbar("shift_x",    "Detections", 182, 400, lambda v: None)
     input("Press Enter to start detection… ")
     print("Streaming — press q to quit.")
 
@@ -1596,7 +1596,7 @@ def main():
             ref_x = cx0 + btn_x
             ref_y = cy0 + btn_y
             world_scroll_y = gridscroll.update(frame, active_xyxys)
-            log_y_offset = cv2.getTrackbarPos("log_y_offset", "Detections") - 40
+            log_y_offset = cv2.getTrackbarPos("log_y_offset", "Detections") - 80
             grid_margin = min(cv2.getTrackbarPos("grid_margin", "Detections"),
                               gridscroll.lane_h - 1)
             cycle_x = cv2.getTrackbarPos("cycle_x", "Detections") / 10.0
